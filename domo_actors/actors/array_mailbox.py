@@ -91,34 +91,45 @@ class ArrayMailbox(Mailbox):
         
         Inspired by phony's worker pattern: single worker processes all messages
         until queue is empty, then exits. New messages trigger a new worker.
+        
+        Key optimization: Process messages in batches to minimize dispatch restarts.
+        Only exit when queue is truly empty (not just temporarily empty during delivery).
         """
-        try:
-            # Process all messages until queue is empty
-            while True:
-                # Check if we should stop dispatching
-                if self._suspended or self._closed:
-                    break
+        # Process all messages until queue is empty
+        while True:
+            # Check if we should stop dispatching
+            if self._suspended or self._closed:
+                self._dispatching = False
+                return
 
-                # Receive next message
+            # Batch process: get all currently queued messages to avoid restart overhead
+            # Process messages until queue is empty (may refill during delivery)
+            messages_to_process = []
+            while self.is_receivable():
                 message = self.receive()
-
-                # If no message available, we're done
-                if not message.is_deliverable():
+                if message.is_deliverable():
+                    messages_to_process.append(message)
+                else:
                     break
+            
+            # If no messages, we're done - check if more arrived during batching
+            if not messages_to_process:
+                self._dispatching = False
+                # If more messages arrived while we were batching, start a new dispatch
+                if not self._suspended and not self._closed and self.is_receivable():
+                    self._dispatching = True
+                    asyncio.create_task(self._dispatch_all())
+                return
 
-                # Deliver the message
+            # Deliver all batched messages
+            for message in messages_to_process:
+                # Check again before each delivery (might have been suspended/closed)
+                if self._suspended or self._closed:
+                    self._dispatching = False
+                    return
                 await message.deliver()
 
-                # Continue loop to process next message (if any)
-        finally:
-            # Always clear dispatching flag when done
-            self._dispatching = False
-            
-            # If more messages arrived while we were processing, start a new dispatch
-            # This handles the case where messages arrive during message delivery
-            if not self._suspended and not self._closed and self.is_receivable():
-                self._dispatching = True
-                asyncio.create_task(self._dispatch_all())
+            # Continue loop to process any new messages that arrived during delivery
 
     async def dispatch(self) -> None:
         """
