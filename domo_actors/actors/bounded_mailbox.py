@@ -10,6 +10,8 @@
 
 """
 BoundedMailbox - Capacity-limited FIFO mailbox with overflow policies.
+
+Uses the same efficient single-dispatch-task pattern as ArrayMailbox.
 """
 
 import asyncio
@@ -20,7 +22,14 @@ from domo_actors.actors.message import Message, EmptyMessage
 
 
 class BoundedMailbox(Mailbox):
-    """Bounded FIFO mailbox with configurable overflow handling."""
+    """
+    Bounded FIFO mailbox with configurable overflow handling.
+    
+    Uses a single dispatch task pattern (inspired by phony):
+    - Only creates one dispatch task at a time
+    - Dispatch task processes all queued messages until empty
+    - Thread-safe for asyncio's single-threaded event loop
+    """
 
     def __init__(self, capacity: int, overflow_policy: OverflowPolicy = OverflowPolicy.DROP_OLDEST) -> None:
         """
@@ -36,6 +45,7 @@ class BoundedMailbox(Mailbox):
         self._closed: bool = False
         self._suspended: bool = False
         self._dropped_message_count: int = 0
+        self._dispatching: bool = False  # Track if dispatch task is running
 
     def send(self, message: Message) -> None:
         """
@@ -59,11 +69,11 @@ class BoundedMailbox(Mailbox):
         else:
             self._queue.append(message)
 
-            # Trigger dispatch if not suspended
-            # Note: We don't check _dispatching here because the recursive dispatch
-            # will handle processing queued messages, even during self-sends
-            if not self._suspended:
-                asyncio.create_task(self.dispatch())
+            # Only start dispatch if not already dispatching and not suspended
+            # This prevents creating thousands of tasks when sending rapidly
+            if not self._suspended and not self._dispatching:
+                self._dispatching = True
+                asyncio.create_task(self._dispatch_all())
 
     def _handle_overflow(self, new_message: Message) -> None:
         """
@@ -117,31 +127,59 @@ class BoundedMailbox(Mailbox):
             return self._queue.popleft()
         return EmptyMessage
 
+    async def _dispatch_all(self) -> None:
+        """
+        Dispatch all messages from the queue until empty.
+        
+        This is the main dispatch loop that processes all queued messages.
+        Only one instance of this coroutine runs at a time (enforced by _dispatching flag).
+        
+        Inspired by phony's worker pattern: single worker processes all messages
+        until queue is empty, then exits. New messages trigger a new worker.
+        """
+        try:
+            # Process all messages until queue is empty
+            while True:
+                # Check if we should stop dispatching
+                if self._suspended or self._closed:
+                    break
+
+                # Receive next message
+                message = self.receive()
+
+                # If no message available, we're done
+                if not message.is_deliverable():
+                    break
+
+                # Deliver the message
+                await message.deliver()
+
+                # Continue loop to process next message (if any)
+        finally:
+            # Always clear dispatching flag when done
+            self._dispatching = False
+            
+            # If more messages arrived while we were processing, start a new dispatch
+            # This handles the case where messages arrive during message delivery
+            if not self._suspended and not self._closed and self.is_receivable():
+                self._dispatching = True
+                asyncio.create_task(self._dispatch_all())
+
     async def dispatch(self) -> None:
         """
-        Dispatch messages from the queue using self-draining recursion.
-
-        This algorithm prevents message starvation when concurrent send() calls
-        occur during message processing. Uses recursion instead of a loop to
-        allow self-sends to be processed correctly.
+        Dispatch messages from the queue (legacy method for compatibility).
+        
+        This method is kept for backward compatibility but delegates to _dispatch_all().
+        The new implementation uses _dispatch_all() which processes all messages efficiently.
         """
-        # Check if we should stop dispatching
-        if self._suspended or self._closed:
+        # If already dispatching, don't start another task
+        if self._dispatching:
             return
-
-        # Receive next message
-        message = self.receive()
-
-        # If no message available, exit
-        if not message.is_deliverable():
-            return
-
-        # Deliver the message
-        await message.deliver()
-
-        # Check if there are more messages to process and recursively dispatch
-        if self.is_receivable():
-            await self.dispatch()
+        
+        # Start dispatch if not suspended/closed and have messages
+        if not self._suspended and not self._closed and self.is_receivable():
+            self._dispatching = True
+            asyncio.create_task(self._dispatch_all())
 
     def suspend(self) -> None:
         """Suspend message processing."""
@@ -151,9 +189,10 @@ class BoundedMailbox(Mailbox):
         """Resume message processing and trigger dispatch."""
         self._suspended = False
 
-        # Trigger dispatch if there are pending messages
-        if self.is_receivable():
-            asyncio.create_task(self.dispatch())
+        # Trigger dispatch if there are pending messages and not already dispatching
+        if self.is_receivable() and not self._dispatching:
+            self._dispatching = True
+            asyncio.create_task(self._dispatch_all())
 
     def close(self) -> None:
         """Close the mailbox."""
@@ -210,4 +249,5 @@ class BoundedMailbox(Mailbox):
     def __str__(self) -> str:
         """String representation."""
         return (f"BoundedMailbox(size={len(self._queue)}, capacity={self._capacity}, "
-                f"policy={self._overflow_policy.value}, dropped={self._dropped_message_count})")
+                f"policy={self._overflow_policy.value}, dropped={self._dropped_message_count}, "
+                f"dispatching={self._dispatching})")
